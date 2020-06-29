@@ -1,0 +1,371 @@
+# Copyright (c) 2017-present, Facebook, Inc.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+import argparse
+import os
+import pickle
+import time
+
+import faiss
+import numpy as np
+from sklearn.metrics.cluster import normalized_mutual_info_score
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim
+import torch.utils.data
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+
+import deepcluster.clustering as clustering
+import deepcluster.models as models
+from deepcluster.util import AverageMeter, Logger, UnifLabelSampler
+from Utils import build_paths
+from Dataset import UCF10
+
+from deepcluster.models.pytorch_i3d import InceptionI3d
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='PyTorch Implementation of DeepCluster')
+
+    parser.add_argument('--arch', '-a', type=str, metavar='ARCH',
+                        choices=['alexnet', 'vgg16', 'c3d'], default='alexnet',
+                        help='CNN architecture (default: alexnet)')
+    parser.add_argument('--sobel', action='store_true', help='Sobel filtering')
+    parser.add_argument('--clustering', type=str, choices=['Kmeans', 'PIC'],
+                        default='Kmeans', help='clustering algorithm (default: Kmeans)')
+    parser.add_argument('--nmb_cluster', '--k', type=int, default=10000,
+                        help='number of cluster for k-means (default: 10000)')
+    parser.add_argument('--lr', default=0.0001, type=float,
+                        help='learning rate (default: 0.05)')
+    parser.add_argument('--wd', default=-5, type=float,
+                        help='weight decay pow (default: -5)')
+    parser.add_argument('--reassign', type=float, default=1.,
+                        help="""how many epochs of training between two consecutive
+                        reassignments of clusters (default: 1)""")
+    parser.add_argument('--workers', default=16, type=int,
+                        help='number of data loading workers (default: 4)')
+    parser.add_argument('--epochs', type=int, default=200,
+                        help='number of total epochs to run (default: 200)')
+    parser.add_argument('--start_epoch', default=0, type=int,
+                        help='manual epoch number (useful on restarts) (default: 0)')
+    parser.add_argument('--batch', default=40, type=int,
+                        help='mini-batch size (default: 256)')
+    parser.add_argument('--momentum', default=0.9, type=float, help='momentum (default: 0.9)')
+    parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                        help='path to checkpoint (default: None)')
+    parser.add_argument('--checkpoints', type=int, default=25000,
+                        help='how many iterations between two checkpoints (default: 25000)')
+    parser.add_argument('--seed', type=int, default=31, help='random seed (default: 31)')
+    parser.add_argument('--exp', type=str, default='', help='path to exp folder')
+    parser.add_argument('--verbose', action='store_true', help='chatty')
+    parser.add_argument('--ucf',type=int, default=1, help='using ucf101 dataset?')
+    parser.add_argument('--cliplen', type=int, default=16, help='clip len')
+
+    return parser.parse_args()
+
+
+def main(args):
+    '''
+    best_acc = 0                                                           # best test accuracy
+    start_epoch = 0                                                        # start from epoch 0 or last checkpoint epoch
+    initial_lr = .00001
+    batch_size = 12
+    num_workers = 2
+    :param args:
+    :return:
+    '''
+    class_idxs, train_split, test_split, frames_root, remaining = build_paths()
+
+    #parameters for UCF101 dataset loading
+    num_classes = 101
+    clip_len = args.cliplen
+
+    # fix random seeds
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    print("device_count", torch.cuda.device_count())
+    # CNN
+    if args.verbose:
+        print('Architecture: {}'.format(args.arch))
+    mode = 'rgb'
+    if mode == 'flow':
+        model = InceptionI3d(400, in_channels=2)
+        model.load_state_dict(torch.load('./pytorch_i3d/models/flow_imagenet.pt'))
+    else:
+        model = InceptionI3d(400, in_channels=3)
+        model.load_state_dict(torch.load('./pytorch_i3d/models/rgb_imagenet.pt'))
+    # fd = int(model.top_layer.weight.size()[1])
+    # model.top_layer = None
+    #model.replace_logits(args.nmb_cluster)
+    model.logits=None
+    model = torch.nn.DataParallel(model)
+    model.cuda()
+    cudnn.benchmark = True
+
+    # create optimizer
+    optimizer = torch.optim.SGD(
+        filter(lambda x: x.requires_grad, model.parameters()),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=10**args.wd,
+    )
+
+    # define loss function
+    criterion = nn.CrossEntropyLoss().cuda()
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            args.start_epoch = checkpoint['epoch']
+            state_dict=checkpoint['state_dict'].copy()
+            to_delete=[]
+            # remove top_layer parameters from checkpoint
+            for key in state_dict:
+                if 'top_layer' in key:
+                    to_delete.append(key)
+            for key in to_delete:
+                del state_dict[key]
+            model.load_state_dict(state_dict)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+    # creating checkpoint repo
+    exp_check = os.path.join(args.exp, 'checkpoints')
+    if not os.path.isdir(exp_check):
+        os.makedirs(exp_check)
+
+    # creating cluster assignments log
+    cluster_log = Logger(os.path.join(args.exp, 'clusters'))
+
+   # load the data
+    end = time.time()
+
+    print('\n==> Preparing Data...\n')
+
+    dataset = UCF10(class_idxs=class_idxs, split=[train_split[0]], frames_root=frames_root,
+                     clip_len=clip_len, train=True, spatial_crop=False)
+
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch, shuffle=False, num_workers=args.workers)
+
+    print('Number of Classes: %d' % num_classes)
+    print('Number of Training Videos: %d' % len(dataset))
+
+    # clustering algorithm to use
+    deepcluster = clustering.__dict__[args.clustering](args.nmb_cluster)
+
+    # training convnet with DeepCluster
+    for epoch in range(args.start_epoch, args.epochs):
+        end = time.time()
+
+        # remove head
+        #model.top_layer = None
+        #model.classifier = nn.Sequential(*list(model.classifier.children())[:-1])
+        model.module.logits = None
+
+        # get the features for the whole dataset
+        features = compute_features(dataloader, model, len(dataset))
+
+        # cluster the features
+        if args.verbose:
+            print('Cluster the features')
+        clustering_loss = deepcluster.cluster(features, verbose=args.verbose)
+
+        # assign pseudo-labels
+        if args.verbose:
+            print('Assign pseudo labels')
+        train_dataset = clustering.cluster_assign(deepcluster.images_lists,
+                                                  dataset)
+        #print(train_dataset)
+        # uniformly sample per target
+        sampler = UnifLabelSampler(int(args.reassign * len(train_dataset)),
+                                   deepcluster.images_lists)
+
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch,
+            num_workers=args.workers,
+            sampler=sampler,
+            pin_memory=True,
+        )
+
+        # set last fully connected layer
+        '''
+        mlp = list(model.classifier.children())
+        mlp.append(nn.ReLU(inplace=True).cuda())
+        model.classifier = nn.Sequential(*mlp)
+        model.top_layer = nn.Linear(fd, len(deepcluster.images_lists))
+        model.top_layer.weight.data.normal_(0, 0.01)
+        model.top_layer.bias.data.zero_()
+        model.top_layer.cuda()
+        '''
+        model.module.replace_logits(args.nmb_cluster)
+        model.module.logits.conv3d.weight = nn.init.kaiming_normal_(model.module.logits.conv3d.weight, mode='fan_out')
+        if model.module.logits.conv3d.bias is not None: model.module.logits.conv3d.bias.data.zero_()
+        model.cuda()
+        # train network with clusters as pseudo-labels
+        end = time.time()
+        loss = train(train_dataloader, model, criterion, optimizer, epoch)
+
+        # print log
+        if args.verbose:
+            print('###### Epoch [{0}] ###### \n'
+                  'Time: {1:.3f} s\n'
+                  'Clustering loss: {2:.3f} \n'
+                  'ConvNet loss: {3:.3f}'
+                  .format(epoch, time.time() - end, clustering_loss, loss))
+            try:
+                nmi = normalized_mutual_info_score(
+                    clustering.arrange_clustering(deepcluster.images_lists),
+                    clustering.arrange_clustering(cluster_log.data[-1])
+                )
+                print('NMI against previous assignment: {0:.3f}'.format(nmi))
+            except IndexError:
+                pass
+            print('####################### \n')
+        # save running checkpoint
+        torch.save({'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer' : optimizer.state_dict()},
+                   os.path.join(args.exp, 'checkpoint.pth.tar'))
+
+        # save cluster assignments
+        cluster_log.log(deepcluster.images_lists)
+
+
+def train(loader, model, crit, opt, epoch):
+    """Training of the CNN.
+        Args:
+            loader (torch.utils.data.DataLoader): Data loader
+            model (nn.Module): CNN
+            crit (torch.nn): loss
+            opt (torch.optim.SGD): optimizer for every parameters with True
+                                   requires_grad in model except top layer
+            epoch (int)
+    """
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    data_time = AverageMeter()
+    forward_time = AverageMeter()
+    backward_time = AverageMeter()
+
+    # switch to train mode
+    model.train()
+
+    # create an optimizer for the last fc layer
+    '''
+    optimizer_tl = torch.optim.SGD(
+        model.top_layer.parameters(),
+        lr=args.lr,
+        weight_decay=10**args.wd,
+    )
+    '''
+    end = time.time()
+    for i, (input_tensor, target) in enumerate(loader):
+        data_time.update(time.time() - end)
+
+        # save checkpoint
+        n = len(loader) * epoch + i
+        if n % args.checkpoints == 0:
+            path = os.path.join(
+                args.exp,
+                'checkpoints',
+                'checkpoint_' + str(n / args.checkpoints) + '.pth.tar',
+            )
+            if args.verbose:
+                print('Save checkpoint at: {0}'.format(path))
+            torch.save({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'optimizer': opt.state_dict()
+            }, path)
+
+        target = target.cuda(non_blocking=True)
+        input_var = torch.autograd.Variable(input_tensor.cuda())
+        target_var = torch.autograd.Variable(target)
+        output = model(input_var)
+
+        '''y_onehot = torch.FloatTensor(target.shape[0], args.nmb_cluster).cuda()
+        print("One hot target", y_onehot.shape)
+        # In your for loop
+        y_onehot.zero_().cuda()
+        print(y_onehot.shape)'''
+        '''y_onehot.scatter_(1, target, 1).cuda()
+        print(y_onehot.shape)
+        print(y_onehot[0])'''
+        #output = output.view(-1,1)
+
+        loss = crit(output, target_var)
+
+        # record loss
+        losses.update(loss.item(), input_tensor.size(0))
+
+        # compute gradient and do SGD step
+        opt.zero_grad()
+        #optimizer_tl.zero_grad()
+        loss.backward()
+        opt.step()
+        #optimizer_tl.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if args.verbose and (i % 200) == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data: {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss: {loss.val:.4f} ({loss.avg:.4f})'
+                  .format(epoch, i, len(loader), batch_time=batch_time,
+                          data_time=data_time, loss=losses))
+
+    return losses.avg
+
+def compute_features(dataloader, model, N):
+    if args.verbose:
+        print('Compute features')
+    batch_time = AverageMeter()
+    end = time.time()
+    model.eval()
+    # discard the label information in the dataloader
+    for i, (input_tensor, _) in enumerate(dataloader):
+        torch.no_grad()
+        input_var = torch.autograd.Variable(input_tensor.cuda())#, volatile=True)
+        print("Input var shape: ", input_var.shape)
+        aux = model(input_var).data.cpu().numpy()
+        print("Aux shape: ", aux.shape)
+        if i == 0:
+            features = np.zeros((N, aux.shape[1]), dtype='float32')
+        
+        aux = aux.astype('float32')
+        if i < len(dataloader) - 1:
+            features[i * args.batch: (i + 1) * args.batch] = aux
+        else:
+            # special treatment for final batch
+            features[i * args.batch:] = aux
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if args.verbose and (i % 200) == 0:
+            print('{0} / {1}\t' 
+                  'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})'
+                  .format(i, len(dataloader), batch_time=batch_time))
+    return features
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    main(args)
