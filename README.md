@@ -1,6 +1,6 @@
 # ucf-101
 
-## How to Train DeepCluster with i3d as base on UCF-101 data
+## How to Train DeepCluster with i3d on UCF-101 data
 
 1. Change paths to dataset in build_paths function in Utils.py
 2. (Not required) Edit sampling method in create_frames function in Utils.py
